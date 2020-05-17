@@ -9,27 +9,32 @@ const fs = require('fs');
 const path = require('path');
 const router = express.Router();
 
-router.get('/admin/products', restrict, (req, res, next) => {
-    const db = req.app.db;
-    // get the top results
-    db.products.find({}).sort({ productAddedDate: -1 }).limit(10).toArray((err, topResults) => {
-        if(err){
-            console.info(err.stack);
-        }
-        res.render('products', {
-            title: 'Cart',
-            top_results: topResults,
-            session: req.session,
-            admin: true,
-            config: req.app.config,
-            message: common.clearSessionValue(req.session, 'message'),
-            messageType: common.clearSessionValue(req.session, 'messageType'),
-            helpers: req.handlebars.helpers
-        });
+router.get('/admin/products/:page?', restrict, async (req, res, next) => {
+    let pageNum = 1;
+    if(req.params.page){
+        pageNum = req.params.page;
+    }
+
+    // Get our paginated data
+    const products = await common.paginateData(false, req, pageNum, 'products', {}, { productAddedDate: -1 });
+
+    res.render('products', {
+        title: 'Cart',
+        results: products.data,
+        totalItemCount: products.totalItems,
+        pageNum,
+        paginateUrl: 'admin/products',
+        resultType: 'top',
+        session: req.session,
+        admin: true,
+        config: req.app.config,
+        message: common.clearSessionValue(req.session, 'message'),
+        messageType: common.clearSessionValue(req.session, 'messageType'),
+        helpers: req.handlebars.helpers
     });
 });
 
-router.get('/admin/products/filter/:search', (req, res, next) => {
+router.get('/admin/products/filter/:search', restrict, async (req, res, next) => {
     const db = req.app.db;
     const searchTerm = req.params.search;
     const productsIndex = req.app.productsIndex;
@@ -40,27 +45,30 @@ router.get('/admin/products/filter/:search', (req, res, next) => {
     });
 
     // we search on the lunr indexes
-    db.products.find({ _id: { $in: lunrIdArray } }).toArray((err, results) => {
-        if(err){
-            console.error(colors.red('Error searching', err));
-        }
-        res.render('products', {
-            title: 'Results',
-            results: results,
-            admin: true,
-            config: req.app.config,
-            session: req.session,
-            searchTerm: searchTerm,
-            message: common.clearSessionValue(req.session, 'message'),
-            messageType: common.clearSessionValue(req.session, 'messageType'),
-            helpers: req.handlebars.helpers
-        });
+    const results = await db.products.find({ _id: { $in: lunrIdArray } }).toArray();
+
+    if(req.apiAuthenticated){
+        res.status(200).json(results);
+        return;
+    }
+
+    res.render('products', {
+        title: 'Results',
+        results: results,
+        resultType: 'filtered',
+        admin: true,
+        config: req.app.config,
+        session: req.session,
+        searchTerm: searchTerm,
+        message: common.clearSessionValue(req.session, 'message'),
+        messageType: common.clearSessionValue(req.session, 'messageType'),
+        helpers: req.handlebars.helpers
     });
 });
 
 // insert form
 router.get('/admin/product/new', restrict, checkAccess, (req, res) => {
-    res.render('product_new', {
+    res.render('product-new', {
         title: 'New product',
         session: req.session,
         productTitle: common.clearSessionValue(req.session, 'productTitle'),
@@ -77,417 +85,359 @@ router.get('/admin/product/new', restrict, checkAccess, (req, res) => {
 });
 
 // insert new product form action
-router.post('/admin/product/insert', restrict, checkAccess, (req, res) => {
+router.post('/admin/product/insert', restrict, checkAccess, async (req, res) => {
     const db = req.app.db;
-
-    // Process supplied options
-    let productOptions = req.body.productOptions;
-    if(productOptions && typeof productOptions !== 'object'){
-        try{
-            productOptions = JSON.parse(req.body.productOptions);
-        }catch(ex){
-            console.log('Failure to parse options');
-        }
-    }
 
     const doc = {
         productPermalink: req.body.productPermalink,
         productTitle: common.cleanHtml(req.body.productTitle),
-        productPrice: common.safeParseInt(req.body.productPrice),
+        productPrice: req.body.productPrice,
         productDescription: common.cleanHtml(req.body.productDescription),
         productPublished: common.convertBool(req.body.productPublished),
         productTags: req.body.productTags,
-        productOptions: productOptions || null,
         productComment: common.checkboxBool(req.body.productComment),
         productAddedDate: new Date(),
-        productStock: common.safeParseInt(req.body.productStock) || null
+        productStock: common.safeParseInt(req.body.productStock) || null,
+        productStockDisable: common.convertBool(req.body.productStockDisable)
     };
 
     // Validate the body again schema
-    const schemaResult = validateJson('newProduct', doc);
-    if(!schemaResult.valid){
-        // If API request, return json
-        if(req.apiAuthenticated){
-            res.status(400).json(schemaResult.errors);
-            return;
-        }
-
-        console.log('schemaResult errors', schemaResult.errors);
-        req.session.message = 'Form invalid. Please check values and try again.';
-        req.session.messageType = 'danger';
-
-        // keep the current stuff
-        req.session.productTitle = req.body.productTitle;
-        req.session.productDescription = req.body.productDescription;
-        req.session.productPrice = req.body.productPrice;
-        req.session.productPermalink = req.body.productPermalink;
-        req.session.productOptions = productOptions;
-        req.session.productComment = common.checkboxBool(req.body.productComment);
-        req.session.productTags = req.body.productTags;
-        req.session.productStock = req.body.productStock ? parseInt(req.body.productStock) : null;
-
-        // redirect to insert
-        res.redirect('/admin/product/new');
+    const schemaValidate = validateJson('newProduct', doc);
+    if(!schemaValidate.result){
+        console.log('schemaValidate errors', schemaValidate.errors);
+        res.status(400).json(schemaValidate.errors);
         return;
     }
 
-    db.products.count({ productPermalink: req.body.productPermalink }, (err, product) => {
-        if(err){
-            console.info(err.stack);
-        }
-        if(product > 0 && req.body.productPermalink !== ''){
-            // permalink exits
-            req.session.message = 'Permalink already exists. Pick a new one.';
-            req.session.messageType = 'danger';
+    // Check permalink doesn't already exist
+    const product = await db.products.countDocuments({ productPermalink: req.body.productPermalink });
+    if(product > 0 && req.body.productPermalink !== ''){
+        res.status(400).json({ message: 'Permalink already exists. Pick a new one.' });
+        return;
+    }
 
-            // keep the current stuff
-            req.session.productTitle = req.body.productTitle;
-            req.session.productDescription = req.body.productDescription;
-            req.session.productPrice = req.body.productPrice;
-            req.session.productPermalink = req.body.productPermalink;
-            req.session.productOptions = productOptions;
-            req.session.productComment = common.checkboxBool(req.body.productComment);
-            req.session.productTags = req.body.productTags;
-            req.session.productStock = req.body.productStock ? parseInt(req.body.productStock) : null;
+    try{
+        const newDoc = await db.products.insertOne(doc);
+        // get the new ID
+        const newId = newDoc.insertedId;
 
-            // If API request, return json
-            if(req.apiAuthenticated){
-                res.status(400).json({ error: 'Permalink already exists. Pick a new one.' });
-                return;
-            }
-
-            // redirect to insert
-            res.redirect('/admin/product/new');
-            return;
-        }
-        db.products.insert(doc, (err, newDoc) => {
-            if(err){
-                console.log(colors.red('Error inserting document: ' + err));
-
-                // keep the current stuff
-                req.session.productTitle = req.body.productTitle;
-                req.session.productDescription = req.body.productDescription;
-                req.session.productPrice = req.body.productPrice;
-                req.session.productPermalink = req.body.productPermalink;
-                req.session.productOptions = productOptions;
-                req.session.productComment = common.checkboxBool(req.body.productComment);
-                req.session.productTags = req.body.productTags;
-                req.session.productStock = req.body.productStock ? parseInt(req.body.productStock) : null;
-
-                req.session.message = 'Error: Inserting product';
-                req.session.messageType = 'danger';
-
-                // If API request, return json
-                if(req.apiAuthenticated){
-                    res.status(400).json({ error: `Error inserting document: ${err}` });
-                    return;
-                }
-
-                // redirect to insert
-                res.redirect('/admin/product/new');
-                return;
-            }
-            // get the new ID
-            const newId = newDoc.insertedIds[0];
-
-            // add to lunr index
-            indexProducts(req.app)
-            .then(() => {
-                req.session.message = 'New product successfully created';
-                req.session.messageType = 'success';
-
-                // If API request, return json
-                if(req.apiAuthenticated){
-                    res.status(200).json({ message: 'New product successfully created' });
-                    return;
-                }
-
-                // redirect to new doc
-                res.redirect('/admin/product/edit/' + newId);
+        // add to lunr index
+        indexProducts(req.app)
+        .then(() => {
+            res.status(200).json({
+                message: 'New product successfully created',
+                productId: newId
             });
         });
-    });
+    }catch(ex){
+        console.log(colors.red('Error inserting document: ' + ex));
+        res.status(400).json({ message: 'Error inserting document' });
+    }
 });
 
 // render the editor
-router.get('/admin/product/edit/:id', restrict, checkAccess, (req, res) => {
+router.get('/admin/product/edit/:id', restrict, checkAccess, async (req, res) => {
     const db = req.app.db;
 
-    common.getImages(req.params.id, req, res, (images) => {
-        db.products.findOne({ _id: common.getId(req.params.id) }, (err, result) => {
-            if(err){
-                console.info(err.stack);
-            }
-            let options = {};
-            if(result.productOptions){
-                options = result.productOptions;
-            }
+    const images = await common.getImages(req.params.id, req, res);
+    const product = await db.products.findOne({ _id: common.getId(req.params.id) });
+    if(!product){
+        // If API request, return json
+        if(req.apiAuthenticated){
+            res.status(400).json({ message: 'Product not found' });
+            return;
+        }
+        req.session.message = 'Product not found';
+        req.session.messageType = 'danger';
+        res.redirect('/admin/products');
+        return;
+    }
 
-            res.render('product_edit', {
-                title: 'Edit product',
-                result: result,
-                images: images,
-                options: options,
-                admin: true,
-                session: req.session,
-                message: common.clearSessionValue(req.session, 'message'),
-                messageType: common.clearSessionValue(req.session, 'messageType'),
-                config: req.app.config,
-                editor: true,
-                helpers: req.handlebars.helpers
-            });
-        });
+    // Get variants
+    product.variants = await db.variants.find({ product: common.getId(req.params.id) }).toArray();
+
+    // If API request, return json
+    if(req.apiAuthenticated){
+        res.status(200).json(product);
+        return;
+    }
+
+    res.render('product-edit', {
+        title: 'Edit product',
+        result: product,
+        images: images,
+        admin: true,
+        session: req.session,
+        message: common.clearSessionValue(req.session, 'message'),
+        messageType: common.clearSessionValue(req.session, 'messageType'),
+        config: req.app.config,
+        editor: true,
+        helpers: req.handlebars.helpers
     });
+});
+
+// Add a variant to a product
+router.post('/admin/product/addvariant', restrict, checkAccess, async (req, res) => {
+    const db = req.app.db;
+
+    const variantDoc = {
+        product: req.body.product,
+        title: req.body.title,
+        price: req.body.price,
+        stock: common.safeParseInt(req.body.stock) || null
+    };
+
+    // Validate the body again schema
+    const schemaValidate = validateJson('newVariant', variantDoc);
+    if(!schemaValidate.result){
+        if(process.env.NODE_ENV !== 'test'){
+            console.log('schemaValidate errors', schemaValidate.errors);
+        }
+        res.status(400).json(schemaValidate.errors);
+        return;
+    }
+
+    // Check product exists
+    const product = await db.products.findOne({ _id: common.getId(req.body.product) });
+
+    if(!product){
+        console.log('here1?');
+        res.status(400).json({ message: 'Failed to add product variant' });
+        return;
+    }
+
+    // Fix values
+    variantDoc.product = common.getId(req.body.product);
+    variantDoc.added = new Date();
+
+    try{
+        const variant = await db.variants.insertOne(variantDoc);
+        product.variants = variant.ops;
+        res.status(200).json({ message: 'Successfully added variant', product });
+    }catch(ex){
+        console.log('here?');
+        res.status(400).json({ message: 'Failed to add variant. Please try again' });
+    }
+});
+
+// Update an existing product variant
+router.post('/admin/product/editvariant', restrict, checkAccess, async (req, res) => {
+    const db = req.app.db;
+
+    const variantDoc = {
+        product: req.body.product,
+        variant: req.body.variant,
+        title: req.body.title,
+        price: req.body.price,
+        stock: common.safeParseInt(req.body.stock) || null
+    };
+
+    // Validate the body again schema
+    const schemaValidate = validateJson('editVariant', variantDoc);
+    if(!schemaValidate.result){
+        if(process.env.NODE_ENV !== 'test'){
+            console.log('schemaValidate errors', schemaValidate.errors);
+        }
+        res.status(400).json(schemaValidate.errors);
+        return;
+    }
+
+    // Validate ID's
+    const product = await db.products.findOne({ _id: common.getId(req.body.product) });
+    if(!product){
+        res.status(400).json({ message: 'Failed to add product variant' });
+        return;
+    }
+
+    const variant = await db.variants.findOne({ _id: common.getId(req.body.variant) });
+    if(!variant){
+        res.status(400).json({ message: 'Failed to add product variant' });
+        return;
+    }
+
+    // Removed props not needed
+    delete variantDoc.product;
+    delete variantDoc.variant;
+
+    try{
+        const updatedVariant = await db.variants.findOneAndUpdate({
+            _id: common.getId(req.body.variant)
+        }, {
+            $set: variantDoc
+        }, {
+            returnOriginal: false
+        });
+        res.status(200).json({ message: 'Successfully saved variant', variant: updatedVariant.value });
+    }catch(ex){
+        res.status(400).json({ message: 'Failed to save variant. Please try again' });
+    }
+});
+
+// Remove a product variant
+router.post('/admin/product/removevariant', restrict, checkAccess, async (req, res) => {
+    const db = req.app.db;
+
+    const variant = await db.variants.findOne({ _id: common.getId(req.body.variant) });
+    if(!variant){
+        res.status(400).json({ message: 'Failed to remove product variant' });
+        return;
+    }
+
+    try{
+        // Delete the variant
+        await db.variants.deleteOne({ _id: variant._id }, {});
+        res.status(200).json({ message: 'Successfully removed variant' });
+    }catch(ex){
+        res.status(400).json({ message: 'Failed to remove variant. Please try again' });
+    }
 });
 
 // Update an existing product form action
-router.post('/admin/product/update', restrict, checkAccess, (req, res) => {
+router.post('/admin/product/update', restrict, checkAccess, async (req, res) => {
     const db = req.app.db;
 
-    db.products.findOne({ _id: common.getId(req.body.productId) }, (err, product) => {
-        if(err){
-            console.info(err.stack);
-            req.session.message = 'Failed updating product.';
-            req.session.messageType = 'danger';
+    const product = await db.products.findOne({ _id: common.getId(req.body.productId) });
 
-            // If API request, return json
-            if(req.apiAuthenticated){
-                res.status(400).json({ messge: 'Failed to update product' });
-                return;
-            }
+    if(!product){
+        res.status(400).json({ message: 'Failed to update product' });
+        return;
+    }
+    const count = await db.products.countDocuments({ productPermalink: req.body.productPermalink, _id: { $ne: common.getId(product._id) } });
+    if(count > 0 && req.body.productPermalink !== ''){
+        res.status(400).json({ message: 'Permalink already exists. Pick a new one.' });
+        return;
+    }
 
-            res.redirect('/admin/product/edit/' + req.body.productId);
-            return;
+    const images = await common.getImages(req.body.productId, req, res);
+    const productDoc = {
+        productId: req.body.productId,
+        productPermalink: req.body.productPermalink,
+        productTitle: common.cleanHtml(req.body.productTitle),
+        productPrice: req.body.productPrice,
+        productDescription: common.cleanHtml(req.body.productDescription),
+        productPublished: common.convertBool(req.body.productPublished),
+        productTags: req.body.productTags,
+        productComment: common.checkboxBool(req.body.productComment),
+        productStock: common.safeParseInt(req.body.productStock) || null,
+        productStockDisable: common.convertBool(req.body.productStockDisable)
+    };
+
+    // Validate the body again schema
+    const schemaValidate = validateJson('editProduct', productDoc);
+    if(!schemaValidate.result){
+        res.status(400).json(schemaValidate.errors);
+        return;
+    }
+
+    // Remove productId from doc
+    delete productDoc.productId;
+
+    // if no featured image
+    if(!product.productImage){
+        if(images.length > 0){
+            productDoc.productImage = images[0].path;
+        }else{
+            productDoc.productImage = '/uploads/placeholder.png';
         }
-        db.products.count({ productPermalink: req.body.productPermalink, _id: { $ne: common.getId(product._id) } }, (err, count) => {
-            if(err){
-                console.info(err.stack);
+    }else{
+        productDoc.productImage = product.productImage;
+    }
 
-                // If API request, return json
-                if(req.apiAuthenticated){
-                    res.status(400).json({ messge: 'Failed to update product' });
-                    return;
-                }
-
-                req.session.message = 'Failed updating product.';
-                req.session.messageType = 'danger';
-                res.redirect('/admin/product/edit/' + req.body.productId);
-                return;
-            }
-
-            if(count > 0 && req.body.productPermalink !== ''){
-                // If API request, return json
-                if(req.apiAuthenticated){
-                    res.status(400).json({ messge: 'Permalink already exists. Pick a new one' });
-                    return;
-                }
-
-                // permalink exits
-                req.session.message = 'Permalink already exists. Pick a new one.';
-                req.session.messageType = 'danger';
-
-                // keep the current stuff
-                req.session.productTitle = req.body.productTitle;
-                req.session.productDescription = req.body.productDescription;
-                req.session.productPrice = req.body.productPrice;
-                req.session.productPermalink = req.body.productPermalink;
-                req.session.productTags = req.body.productTags;
-                req.session.productOptions = req.body.productOptions;
-                req.session.productComment = common.checkboxBool(req.body.productComment);
-                req.session.productStock = req.body.productStock ? req.body.productStock : null;
-
-                // redirect to insert
-                res.redirect('/admin/product/edit/' + req.body.productId);
-            }else{
-                common.getImages(req.body.productId, req, res, (images) => {
-                    // Process supplied options
-                    let productOptions = req.body.productOptions;
-                    if(productOptions && typeof productOptions !== 'object'){
-                        try{
-                            productOptions = JSON.parse(req.body.productOptions);
-                        }catch(ex){
-                            console.log('Failure to parse options');
-                        }
-                    }
-
-                    const productDoc = {
-                        productId: req.body.productId,
-                        productPermalink: req.body.productPermalink,
-                        productTitle: common.cleanHtml(req.body.productTitle),
-                        productPrice: common.safeParseInt(req.body.productPrice),
-                        productDescription: common.cleanHtml(req.body.productDescription),
-                        productPublished: common.convertBool(req.body.productPublished),
-                        productTags: req.body.productTags,
-                        productOptions: productOptions || null,
-                        productComment: common.checkboxBool(req.body.productComment),
-                        productStock: common.safeParseInt(req.body.productStock) || null
-                    };
-
-                    // Validate the body again schema
-                    const schemaResult = validateJson('editProduct', productDoc);
-                    if(!schemaResult.valid){
-                        // If API request, return json
-                        if(req.apiAuthenticated){
-                            res.status(400).json(schemaResult.errors);
-                            return;
-                        }
-
-                        req.session.message = 'Form invalid. Please check values and try again.';
-                        req.session.messageType = 'danger';
-
-                        // keep the current stuff
-                        req.session.productTitle = req.body.productTitle;
-                        req.session.productDescription = req.body.productDescription;
-                        req.session.productPrice = req.body.productPrice;
-                        req.session.productPermalink = req.body.productPermalink;
-                        req.session.productOptions = productOptions;
-                        req.session.productComment = common.checkboxBool(req.body.productComment);
-                        req.session.productTags = req.body.productTags;
-                        req.session.productStock = req.body.productStock ? parseInt(req.body.productStock) : null;
-
-                        // redirect to insert
-                        res.redirect('/admin/product/edit/' + req.body.productId);
-                        return;
-                    }
-
-                    // Remove productId from doc
-                    delete productDoc.productId;
-
-                    // if no featured image
-                    if(!product.productImage){
-                        if(images.length > 0){
-                            productDoc['productImage'] = images[0].path;
-                        }else{
-                            productDoc['productImage'] = '/uploads/placeholder.png';
-                        }
-                    }else{
-                        productDoc['productImage'] = product.productImage;
-                    }
-
-                    db.products.update({ _id: common.getId(req.body.productId) }, { $set: productDoc }, {}, (err, numReplaced) => {
-                        if(err){
-                            // If API request, return json
-                            if(req.apiAuthenticated){
-                                res.status(400).json({ messge: 'Failed to save. Please try again' });
-                                return;
-                            }
-
-                            console.error(colors.red('Failed to save product: ' + err));
-                            req.session.message = 'Failed to save. Please try again';
-                            req.session.messageType = 'danger';
-                            res.redirect('/admin/product/edit/' + req.body.productId);
-                        }else{
-                            // Update the index
-                            indexProducts(req.app)
-                            .then(() => {
-                                // If API request, return json
-                                if(req.apiAuthenticated){
-                                    res.status(200).json({ message: 'Successfully saved', product: productDoc });
-                                    return;
-                                }
-
-                                req.session.message = 'Successfully saved';
-                                req.session.messageType = 'success';
-                                res.redirect('/admin/product/edit/' + req.body.productId);
-                            });
-                        }
-                    });
-                });
-            }
+    try{
+        await db.products.updateOne({ _id: common.getId(req.body.productId) }, { $set: productDoc }, {});
+        // Update the index
+        indexProducts(req.app)
+        .then(() => {
+            res.status(200).json({ message: 'Successfully saved', product: productDoc });
         });
-    });
+    }catch(ex){
+        res.status(400).json({ message: 'Failed to save. Please try again' });
+    }
 });
 
-// delete product
-router.get('/admin/product/delete/:id', restrict, checkAccess, (req, res) => {
+// delete a product
+router.post('/admin/product/delete', restrict, checkAccess, async (req, res) => {
     const db = req.app.db;
 
-    // remove the article
-    db.products.remove({ _id: common.getId(req.params.id) }, {}, (err, numRemoved) => {
+    // remove the product
+    await db.products.deleteOne({ _id: common.getId(req.body.productId) }, {});
+
+    // Remove the variants
+    await db.variants.deleteMany({ product: common.getId(req.body.productId) }, {});
+
+    // delete any images and folder
+    rimraf('public/uploads/' + req.body.productId, (err) => {
         if(err){
             console.info(err.stack);
+            res.status(400).json({ message: 'Failed to delete product' });
         }
-        // delete any images and folder
-        rimraf('public/uploads/' + req.params.id, (err) => {
-            if(err){
-                console.info(err.stack);
-            }
 
-            // remove the index
-            indexProducts(req.app)
-            .then(() => {
-                // redirect home
-                req.session.message = 'Product successfully deleted';
-                req.session.messageType = 'success';
-                res.redirect('/admin/products');
-            });
+        // re-index products
+        indexProducts(req.app)
+        .then(() => {
+            res.status(200).json({ message: 'Product successfully deleted' });
         });
     });
 });
 
 // update the published state based on an ajax call from the frontend
-router.post('/admin/product/published_state', restrict, checkAccess, (req, res) => {
+router.post('/admin/product/publishedState', restrict, checkAccess, async (req, res) => {
     const db = req.app.db;
 
-    db.products.update({ _id: common.getId(req.body.id) }, { $set: { productPublished: req.body.state } }, { multi: false }, (err, numReplaced) => {
-        if(err){
-            console.error(colors.red('Failed to update the published state: ' + err));
-            res.status(400).json('Published state not updated');
-        }else{
-            res.status(200).json('Published state updated');
-        }
-    });
+    try{
+        await db.products.updateOne({ _id: common.getId(req.body.id) }, { $set: { productPublished: common.convertBool(req.body.state) } }, { multi: false });
+        res.status(200).json({ message: 'Published state updated' });
+    }catch(ex){
+        console.error(colors.red('Failed to update the published state: ' + ex));
+        res.status(400).json({ message: 'Published state not updated' });
+    }
 });
 
 // set as main product image
-router.post('/admin/product/setasmainimage', restrict, checkAccess, (req, res) => {
+router.post('/admin/product/setasmainimage', restrict, checkAccess, async (req, res) => {
     const db = req.app.db;
 
-    // update the productImage to the db
-    db.products.update({ _id: common.getId(req.body.product_id) }, { $set: { productImage: req.body.productImage } }, { multi: false }, (err, numReplaced) => {
-        if(err){
-            res.status(400).json({ message: 'Unable to set as main image. Please try again.' });
-        }else{
-            res.status(200).json({ message: 'Main image successfully set' });
-        }
-    });
+    try{
+        // update the productImage to the db
+        await db.products.updateOne({ _id: common.getId(req.body.product_id) }, { $set: { productImage: req.body.productImage } }, { multi: false });
+        res.status(200).json({ message: 'Main image successfully set' });
+    }catch(ex){
+        res.status(400).json({ message: 'Unable to set as main image. Please try again.' });
+    }
 });
 
 // deletes a product image
-router.post('/admin/product/deleteimage', restrict, checkAccess, (req, res) => {
+router.post('/admin/product/deleteimage', restrict, checkAccess, async (req, res) => {
     const db = req.app.db;
 
     // get the productImage from the db
-    db.products.findOne({ _id: common.getId(req.body.product_id) }, (err, product) => {
-        if(err){
-            console.info(err.stack);
-        }
-        if(req.body.productImage === product.productImage){
-            // set the produt_image to null
-            db.products.update({ _id: common.getId(req.body.product_id) }, { $set: { productImage: null } }, { multi: false }, (err, numReplaced) => {
-                if(err){
-                    console.info(err.stack);
-                }
-                // remove the image from disk
-                fs.unlink(path.join('public', req.body.productImage), (err) => {
-                    if(err){
-                        res.status(400).json({ message: 'Image not removed, please try again.' });
-                    }else{
-                        res.status(200).json({ message: 'Image successfully deleted' });
-                    }
-                });
-            });
-        }else{
-            // remove the image from disk
-            fs.unlink(path.join('public', req.body.productImage), (err) => {
-                if(err){
-                    res.status(400).json({ message: 'Image not removed, please try again.' });
-                }else{
-                    res.status(200).json({ message: 'Image successfully deleted' });
-                }
-            });
-        }
-    });
+    const product = await db.products.findOne({ _id: common.getId(req.body.product_id) });
+    if(!product){
+        res.status(400).json({ message: 'Product not found' });
+        return;
+    }
+    if(req.body.productImage === product.productImage){
+        // set the productImage to null
+        await db.products.updateOne({ _id: common.getId(req.body.product_id) }, { $set: { productImage: null } }, { multi: false });
+
+        // remove the image from disk
+        fs.unlink(path.join('public', req.body.productImage), (err) => {
+            if(err){
+                res.status(400).json({ message: 'Image not removed, please try again.' });
+            }else{
+                res.status(200).json({ message: 'Image successfully deleted' });
+            }
+        });
+    }else{
+        // remove the image from disk
+        fs.unlink(path.join('public', req.body.productImage), (err) => {
+            if(err){
+                res.status(400).json({ message: 'Image not removed, please try again.' });
+            }else{
+                res.status(200).json({ message: 'Image successfully deleted' });
+            }
+        });
+    }
 });
 
 module.exports = router;
